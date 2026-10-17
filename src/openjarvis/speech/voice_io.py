@@ -88,6 +88,15 @@ def record_until_silence(
     frames: list[bytes] = []
     silence_count = 0
     has_speech = False
+    try:
+        from openjarvis.speech.wake import is_playback_active
+
+        while is_playback_active():
+            import time
+
+            time.sleep(0.02)
+    except Exception:
+        pass
 
     with sd.RawInputStream(
         samplerate=sample_rate,
@@ -153,8 +162,11 @@ def play_wav(audio: bytes, sample_rate: int = 24000) -> None:
         )
         sr = sample_rate
 
-    sd.play(data, sr)
-    sd.wait()
+    from openjarvis.speech.wake import playback_guard
+
+    with playback_guard():
+        sd.play(data, sr)
+        sd.wait()
 
 
 __all__ = ["play_wav", "record_until_silence"]

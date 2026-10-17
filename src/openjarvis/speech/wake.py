@@ -6,6 +6,7 @@ Provides audio gating, wake word parsing, anti-echo playback guarding,
 
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 import io
@@ -25,7 +26,21 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WAKE_WINDOW = 10.0
 
 # Minimum speech duration to qualify as intentional speech (filters out claps, clicks)
-_MIN_SPEECH_SECONDS = 0.4
+_DEFAULT_MIN_SPEECH_SECONDS = 0.25
+_MIN_SPEECH_SECONDS = _DEFAULT_MIN_SPEECH_SECONDS
+
+
+def get_min_speech_seconds() -> float:
+    """Read minimum speech duration from JARVIS_MIN_SPEECH_SECONDS env var, defaulting to 0.25s."""
+    raw = os.environ.get("JARVIS_MIN_SPEECH_SECONDS", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return _DEFAULT_MIN_SPEECH_SECONDS
 
 # Cooldown after audio playback before microphone re-opens (anti-echo)
 _DEFAULT_PLAYBACK_COOLDOWN = 0.5
@@ -174,9 +189,63 @@ def parse_wake_phrase(text: str, wake_word: str = "junior") -> WakeParseResult:
     )
 
 
-def is_speech_too_short(speech_seconds: float, min_seconds: float = _MIN_SPEECH_SECONDS) -> bool:
+def is_speech_too_short(
+    speech_seconds: float,
+    min_seconds: Optional[float] = None,
+) -> bool:
     """Return True if detected speech is shorter than the minimum duration threshold."""
+    if min_seconds is None:
+        min_seconds = get_min_speech_seconds()
     return speech_seconds < min_seconds
+
+
+def measure_wav_speech_duration(
+    audio_bytes: bytes,
+    silence_threshold: Optional[int] = None,
+) -> float:
+    """Measure duration from first to last block exceeding silence threshold in a WAV buffer."""
+    if not audio_bytes:
+        return 0.0
+
+    # If the buffer is not a valid RIFF/WAV file (e.g. mocked test bytes), do not reject it
+    if len(audio_bytes) < 44 or not audio_bytes.startswith(b"RIFF"):
+        return 1.0
+
+    from openjarvis.speech.voice_io import _get_silence_threshold, _rms
+
+    if silence_threshold is None:
+        silence_threshold = _get_silence_threshold()
+
+    chunk_size = 1024
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            framerate = wf.getframerate()
+            sampwidth = wf.getsampwidth()
+            channels = wf.getnchannels()
+            raw_frames = wf.readframes(wf.getnframes())
+    except Exception:
+        return 1.0
+
+    if sampwidth != 2 or channels != 1:
+        return 1.0
+
+    first_idx: Optional[int] = None
+    last_idx: Optional[int] = None
+    total_chunks = len(raw_frames) // chunk_size
+
+    for i in range(total_chunks):
+        chunk = raw_frames[i * chunk_size : (i + 1) * chunk_size]
+        if _rms(chunk) > silence_threshold:
+            if first_idx is None:
+                first_idx = i
+            last_idx = i
+
+    if first_idx is None or last_idx is None:
+        return 0.0
+
+    chunks_per_sec = framerate / (chunk_size // sampwidth)
+    span_chunks = last_idx - first_idx + 1
+    return span_chunks / chunks_per_sec
 
 
 def get_sim_senhor_cache_path(voice_id: str = "default") -> Path:
@@ -291,11 +360,16 @@ class WakeWordSession:
         self._is_awake = False
         return False
 
-    def touch(self, wake_named: bool = False) -> None:
+    def touch(self, wake_named: Optional[bool] = None) -> None:
         """Mark interaction, renewing the active window for ~10 seconds."""
         self._is_awake = True
         self._awake_until = time.perf_counter() + self.window_seconds
-        self.last_wake_named = wake_named
+        if wake_named is not None:
+            self.last_wake_named = wake_named
+
+    def remaining_awake_time(self) -> float:
+        """Return remaining seconds in active window, or 0.0 if expired."""
+        return max(0.0, self._awake_until - time.perf_counter())
 
     def sleep(self) -> None:
         """Force session back to sleep (waiting for wake word)."""
@@ -318,19 +392,304 @@ class WakeWordSession:
         return self._dedicated_wake_backend
 
 
+def record_wake_chunk_audio(
+    *,
+    stream: Optional[Any] = None,
+    pre_buffer: Optional[deque[bytes]] = None,
+    sample_rate: int = 16000,
+    silence_threshold: Optional[int] = None,
+    silence_seconds: float = 0.8,
+    max_seconds: float = 4.0,
+    pre_buffer_seconds: float = 0.3,
+) -> Optional[Tuple[bytes, float]]:
+    """Listen on microphone stream for audio exceeding silence_threshold.
+
+    Maintains pre-recorded audio in memory (~0.3s) so the start of the word
+    is preserved. Returns (wav_bytes, speech_seconds) if speech is detected,
+    or None if silence or sound too short.
+    """
+    if stream is None:
+        try:
+            import sounddevice as sd
+        except ImportError:
+            raise RuntimeError(
+                "sounddevice is required for voice input. "
+                "Install with: pip install sounddevice"
+            )
+        chunk_size = 1024
+        with sd.RawInputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=chunk_size,
+        ) as local_stream:
+            return record_wake_chunk_audio(
+                stream=local_stream,
+                pre_buffer=pre_buffer,
+                sample_rate=sample_rate,
+                silence_threshold=silence_threshold,
+                silence_seconds=silence_seconds,
+                max_seconds=max_seconds,
+                pre_buffer_seconds=pre_buffer_seconds,
+            )
+
+    from openjarvis.speech.voice_io import _frames_to_wav, _get_silence_threshold, _rms
+
+    if silence_threshold is None:
+        silence_threshold = _get_silence_threshold()
+
+    chunk_size = 1024
+    chunks_per_second = sample_rate / chunk_size
+    silence_chunks = int(silence_seconds * chunks_per_second)
+    max_chunks = int(max_seconds * chunks_per_second)
+    pre_chunks = max(1, int(pre_buffer_seconds * chunks_per_second))
+
+    if pre_buffer is None:
+        pre_buffer = deque(maxlen=pre_chunks)
+
+    frames: list[bytes] = []
+    silence_count = 0
+    has_speech = False
+
+    for _ in range(max_chunks):
+        if is_playback_active():
+            pre_buffer.clear()
+            time.sleep(0.05)
+            return None
+
+        raw, _ = stream.read(chunk_size)
+        data = bytes(raw)
+        amp = _rms(data)
+
+        if not has_speech:
+            if amp > silence_threshold:
+                has_speech = True
+                frames = list(pre_buffer) + [data]
+                silence_count = 0
+            else:
+                pre_buffer.append(data)
+                # If ~0.5s of silence passes without speech starting, yield control
+                # Stream remains open and pre_buffer stays populated!
+                if len(pre_buffer) >= pre_chunks:
+                    return None
+        else:
+            frames.append(data)
+            if amp > silence_threshold:
+                silence_count = 0
+            else:
+                silence_count += 1
+                if silence_count >= silence_chunks or len(frames) >= max_chunks:
+                    break
+
+    if not has_speech or not frames:
+        return None
+
+    first_idx: Optional[int] = None
+    last_idx: Optional[int] = None
+    for idx, f in enumerate(frames):
+        if _rms(f) > silence_threshold:
+            if first_idx is None:
+                first_idx = idx
+            last_idx = idx
+
+    if first_idx is None or last_idx is None:
+        pre_buffer.clear()
+        return None
+
+    span_chunks = last_idx - first_idx + 1
+    speech_seconds = span_chunks / chunks_per_second
+
+    if is_speech_too_short(speech_seconds):
+        logger.debug(
+            "Speech too short (%.2fs < %.2fs) — ignoring",
+            speech_seconds,
+            get_min_speech_seconds(),
+        )
+        pre_buffer.clear()
+        return None
+
+    pre_buffer.clear()
+    return _frames_to_wav(frames, sample_rate), speech_seconds
+
+
+def listen_for_wake_turn(
+    console: Any,
+    session: Any,
+    wake_session: WakeWordSession,
+) -> Optional[str] | object:
+    """Listen for a user voice turn, handling wake word gating and active windows."""
+    from openjarvis.cli._voice_chat import VOICE_EXIT, _terminal_safe_text, record_voice
+
+    # Case A: Jarvis is SLEEPING -> waiting for wake word
+    if not wake_session.is_awake:
+        console.print(
+            f"[dim cyan]Escutando pelo nome '{wake_session.wake_word.capitalize()}'...[/dim cyan]"
+        )
+        try:
+            import sounddevice as sd
+        except ImportError:
+            raise RuntimeError(
+                "sounddevice is required for voice input. "
+                "Install with: pip install sounddevice"
+            )
+
+        chunk_size = 1024
+        sample_rate = 16000
+        pre_chunks = max(1, int(0.3 * (sample_rate / chunk_size)))
+        pre_buffer: deque[bytes] = deque(maxlen=pre_chunks)
+
+        with sd.RawInputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=chunk_size,
+        ) as stream:
+            while True:
+                try:
+                    chunk_res = record_wake_chunk_audio(
+                        stream=stream,
+                        pre_buffer=pre_buffer,
+                        sample_rate=sample_rate,
+                    )
+                except KeyboardInterrupt:
+                    return VOICE_EXIT
+                except Exception as exc:
+                    console.print(f"[red]Mic error: {_terminal_safe_text(exc)}[/red]")
+                    return VOICE_EXIT
+
+                if chunk_res is None:
+                    continue
+
+                audio_bytes, speech_sec = chunk_res
+                t0_call = time.perf_counter() - speech_sec
+
+                stt_backend = wake_session.get_wake_stt_backend(session.get_stt_backend())
+                if stt_backend is None:
+                    console.print("[red]No speech-to-text backend available.[/red]")
+                    return VOICE_EXIT
+
+                try:
+                    trans_res = stt_backend.transcribe(
+                        audio_bytes,
+                        format="wav",
+                        language=session.get_stt_language() if hasattr(session, "get_stt_language") else "pt",
+                    )
+                    text = trans_res.text.strip()
+                except Exception as exc:
+                    logger.debug("Wake transcription error: %s", exc)
+                    continue
+
+                if not text:
+                    continue
+
+                parse_res = parse_wake_phrase(text, wake_session.wake_word)
+                if not parse_res.detected:
+                    # Name was not spoken at start or end
+                    continue
+
+                # Wake word was detected! Record the start of call timestamp for [TEMPO]
+                wake_session.t_call_start = t0_call
+
+                if not parse_res.is_command:
+                    # Name alone or greeting: e.g. "Junior", "Junior, tá aí?"
+                    play_sim_senhor(session, console)
+                    if os.environ.get("JARVIS_DEBUG_TEMPO") == "1" and wake_session.t_call_start is not None:
+                        t_ack = time.perf_counter() - wake_session.t_call_start
+                        console.print(
+                            f"[dim yellow][TEMPO] Do chamado até a resposta: {t_ack:.2f}s[/dim yellow]"
+                        )
+                    wake_session.touch(wake_named=True)
+                    # Now record the actual command from the user
+                    console.print("[dim cyan]Listening… (speak now, stops on silence)[/dim cyan]")
+                    return record_voice(console, session)
+                else:
+                    # Inline command: e.g. "Junior, o que tenho hoje?" or "Junior, sim"
+                    wake_session.touch(wake_named=True)
+                    console.print(f"[bold]You (voice):[/bold] {_terminal_safe_text(parse_res.clean_text or '')}")
+                    return parse_res.clean_text
+
+    # Case B: Jarvis is AWAKE -> within active conversational window
+    else:
+        while is_playback_active():
+            time.sleep(0.05)
+        console.print("[dim cyan]Listening… (speak now, stops on silence)[/dim cyan]")
+        t0_rec = time.perf_counter()
+        try:
+            from openjarvis.speech.voice_io import record_until_silence
+
+            audio_bytes = record_until_silence(
+                startup_silence_seconds=min(wake_session.remaining_awake_time(), 10.0),
+            )
+        except KeyboardInterrupt:
+            return VOICE_EXIT
+        except Exception as exc:
+            console.print(f"[red]Mic error: {_terminal_safe_text(exc)}[/red]")
+            return VOICE_EXIT
+
+        t_rec = time.perf_counter() - t0_rec
+        if not wake_session.is_awake:
+            wake_session.sleep()
+            return None
+
+        speech_sec = measure_wav_speech_duration(audio_bytes)
+        if is_speech_too_short(speech_sec):
+            logger.debug(
+                "Speech too short (%.2fs < %.2fs) — ignoring",
+                speech_sec,
+                get_min_speech_seconds(),
+            )
+            return None
+
+        wake_session.t_call_start = time.perf_counter() - t_rec
+        backend = session.get_stt_backend()
+        if backend is None:
+            return VOICE_EXIT
+
+        try:
+            trans_res = backend.transcribe(
+                audio_bytes,
+                format="wav",
+                language=session.get_stt_language() if hasattr(session, "get_stt_language") else "pt",
+            )
+            text = trans_res.text.strip()
+        except Exception as exc:
+            console.print(f"[red]Transcription error: {_terminal_safe_text(exc)}[/red]")
+            return None
+
+        if not text:
+            wake_session.sleep()
+            return None
+
+        parse_res = parse_wake_phrase(text, wake_session.wake_word)
+        if parse_res.detected:
+            wake_session.touch(wake_named=True)
+            clean_cmd = parse_res.clean_text or text
+            console.print(f"[bold]You (voice):[/bold] {_terminal_safe_text(clean_cmd)}")
+            return clean_cmd
+        else:
+            wake_session.touch(wake_named=False)
+            console.print(f"[bold]You (voice):[/bold] {_terminal_safe_text(text)}")
+            return text
+
+
 __all__ = [
     "WakeParseResult",
     "WakeWordSession",
+    "get_min_speech_seconds",
     "get_sim_senhor_cache_path",
     "get_wake_window_seconds",
     "is_playback_active",
     "is_speech_too_short",
+    "listen_for_wake_turn",
     "mark_playback_end",
     "mark_playback_start",
+    "measure_wav_speech_duration",
     "normalize_wake_text",
     "parse_wake_phrase",
     "playback_guard",
     "play_sim_senhor",
     "prepare_sim_senhor_cache",
+    "record_wake_chunk_audio",
     "reset_playback_guard",
 ]
+

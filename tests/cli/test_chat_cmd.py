@@ -84,11 +84,33 @@ class TestChatCommand:
         assert "--agent" in result.output
         assert "--tools" in result.output
         assert "--system" in result.output
+        assert "--wake" in result.output
 
     def test_slash_commands_listed(self) -> None:
         result = CliRunner().invoke(chat, ["--help"])
         assert result.exit_code == 0
         assert "/quit" in result.output
+
+    def test_wake_mode_wiring(self) -> None:
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.speech.wake.listen_for_wake_turn", return_value="/quit") as mock_wake_turn,
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--wake", "junior", "--model", "test-model"],
+            )
+
+        assert result.exit_code == 0
+        assert "Voice wake ON ('junior')" in result.output
+        mock_wake_turn.assert_called_once()
 
     def test_voice_mode_preserves_typed_slash_commands(self) -> None:
         engine = MagicMock()

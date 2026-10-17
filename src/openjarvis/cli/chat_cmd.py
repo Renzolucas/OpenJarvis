@@ -80,6 +80,12 @@ def _read_input(prompt: str = "You> ") -> Optional[str]:
     default=False,
     help="Enable voice I/O: mic input with silence detection + TTS response playback.",
 )
+@click.option(
+    "--wake",
+    "wake_word",
+    default=None,
+    help="Enable hands-free wake word activation (e.g. --wake junior). Implies --voice.",
+)
 @runtime_cli_options
 def chat(
     engine_key: str | None,
@@ -90,6 +96,7 @@ def chat(
     system_prompt: str | None,
     persona_name: str | None,
     voice_mode: bool,
+    wake_word: str | None,
     num_ctx: int | None,
     num_gpu: int | None,
     skip_runtime_panel: bool,
@@ -110,9 +117,13 @@ def chat(
       /history      — show conversation history
 
     Pass --voice to use microphone input (silence-detection) and hear responses
-    read back via text-to-speech (kokoro local or OpenAI TTS).
+    read back via text-to-speech (kokoro local or OpenAI TTS). Pass --wake to enable
+    hands-free activation by name.
     """
     console = Console(stderr=True)
+
+    if wake_word:
+        voice_mode = True
 
     config = load_config()
     bus = EventBus(record_history=False)
@@ -294,14 +305,25 @@ def chat(
     # Keep voice state outside the core chat path so picker/runtime changes can
     # be layered independently. Loaded speech models live for this session.
     voice_session = VoiceSession(config) if voice_mode else None
+    wake_session = None
+    if wake_word:
+        from openjarvis.speech.wake import WakeWordSession
+
+        wake_session = WakeWordSession(wake_word=wake_word)
 
     # Print banner
-    voice_hint = (
-        "  [magenta]Voice mode ON[/magenta] — type normally, or press Enter "
-        "to speak; silence stops recording.\n"
-        if voice_mode
-        else ""
-    )
+    if wake_word:
+        voice_hint = (
+            f"  [magenta]Voice wake ON ('{wake_word}')[/magenta] — "
+            "hands-free activation; say the name to talk.\n"
+        )
+    elif voice_mode:
+        voice_hint = (
+            "  [magenta]Voice mode ON[/magenta] — type normally, or press Enter "
+            "to speak; silence stops recording.\n"
+        )
+    else:
+        voice_hint = ""
     console.print(
         f"[green bold]OpenJarvis Chat[/green bold]\n"
         f"  Engine: [cyan]{_safe_rich_label(engine_name)}[/cyan]  "
@@ -369,7 +391,7 @@ def chat(
 
         if voice_mode:
             assert voice_session is not None
-            result = read_voice_input(console, voice_session)
+            result = read_voice_input(console, voice_session, wake_session=wake_session)
             if result is VOICE_EXIT:
                 console.print("\n[dim]Goodbye![/dim]")
                 break
@@ -476,6 +498,9 @@ def chat(
                 agent_context = AgentContext()
                 if voice_mode:
                     agent_context.metadata["voice_mode"] = True
+                if wake_session is not None:
+                    agent_context.metadata["wake_mode"] = True
+                    agent_context.metadata["wake_named"] = wake_session.last_wake_named
                 if agent_context_message is not None:
                     agent_context.conversation.add(agent_context_message)
                 for msg in history[:-1]:
@@ -507,6 +532,16 @@ def chat(
             if voice_mode:
                 assert voice_session is not None
                 speak(content, console, voice_session)
+
+            if os.environ.get("JARVIS_DEBUG_TEMPO") == "1":
+                if wake_session is not None and wake_session.t_call_start is not None:
+                    t_wake = time.perf_counter() - wake_session.t_call_start
+                    console.print(
+                        f"[dim yellow][TEMPO] Do chamado até a resposta: {t_wake:.2f}s[/dim yellow]"
+                    )
+            if wake_session is not None:
+                wake_session.t_call_start = None
+                wake_session.touch()
 
             publish_completed_exchange(
                 bus,

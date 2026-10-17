@@ -119,8 +119,17 @@ class VoiceSession:
         self._tts_backend = None
 
 
-def read_voice_input(console: Any, session: VoiceSession) -> Optional[str] | object:
-    """Accept a typed command/message, or record after an empty submission."""
+def read_voice_input(
+    console: Any,
+    session: VoiceSession,
+    wake_session: Any = None,
+) -> Optional[str] | object:
+    """Accept a typed command/message, or record after an empty submission / wake word."""
+    if wake_session is not None:
+        from openjarvis.speech.wake import listen_for_wake_turn
+
+        return listen_for_wake_turn(console, session, wake_session)
+
     try:
         typed = input("You> [type, or press Enter to speak] ")
     except (EOFError, KeyboardInterrupt):
@@ -164,6 +173,13 @@ def record_voice(
     t_rec = time.perf_counter() - t0_rec
     if os.environ.get("JARVIS_DEBUG_TEMPO") == "1":
         console.print(f"[dim yellow][TEMPO] Gravação até o silêncio: {t_rec:.2f}s[/dim yellow]")
+
+    from openjarvis.speech.wake import is_speech_too_short, measure_wav_speech_duration
+
+    speech_sec = measure_wav_speech_duration(audio_bytes)
+    if is_speech_too_short(speech_sec):
+        console.print("[dim]Som muito curto ignorado.[/dim]")
+        return None
 
     console.print("[dim]Transcribing…[/dim]")
     t0_trans = time.perf_counter()
@@ -213,7 +229,10 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
             if os.environ.get("JARVIS_DEBUG_TEMPO") == "1":
                 console.print(f"[dim yellow][TEMPO] Síntese de voz: {t_synth:.2f}s[/dim yellow]")
             if result.audio:
-                play_wav(result.audio, sample_rate=result.sample_rate)
+                from openjarvis.speech.wake import playback_guard
+
+                with playback_guard():
+                    play_wav(result.audio, sample_rate=result.sample_rate)
             return
         except Exception as exc:
             console.print(

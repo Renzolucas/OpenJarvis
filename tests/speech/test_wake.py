@@ -10,12 +10,14 @@ from unittest.mock import MagicMock, patch
 from openjarvis.speech.wake import (
     WakeParseResult,
     WakeWordSession,
+    get_min_speech_seconds,
     get_sim_senhor_cache_path,
     get_wake_window_seconds,
     is_playback_active,
     is_speech_too_short,
     mark_playback_end,
     mark_playback_start,
+    measure_wav_speech_duration,
     normalize_wake_text,
     parse_wake_phrase,
     playback_guard,
@@ -121,17 +123,75 @@ class TestWakePhraseParsing(unittest.TestCase):
 
 
 class TestShortSpeechFilter(unittest.TestCase):
-    """Test short sound duration threshold (< 0.4s)."""
+    """Test short sound duration threshold (default 0.25s, configurable)."""
 
-    def test_under_0_4s_is_too_short(self):
-        self.assertTrue(is_speech_too_short(0.1))
-        self.assertTrue(is_speech_too_short(0.25))
-        self.assertTrue(is_speech_too_short(0.39))
+    def setUp(self):
+        os.environ.pop("JARVIS_MIN_SPEECH_SECONDS", None)
 
-    def test_at_or_above_0_4s_is_not_too_short(self):
-        self.assertFalse(is_speech_too_short(0.40))
-        self.assertFalse(is_speech_too_short(1.0))
-        self.assertFalse(is_speech_too_short(3.5))
+    def tearDown(self):
+        os.environ.pop("JARVIS_MIN_SPEECH_SECONDS", None)
+
+    def test_default_min_speech_seconds(self):
+        self.assertEqual(get_min_speech_seconds(), 0.25)
+
+    def test_env_override_min_speech_seconds(self):
+        os.environ["JARVIS_MIN_SPEECH_SECONDS"] = "0.35"
+        self.assertEqual(get_min_speech_seconds(), 0.35)
+
+    def test_invalid_env_falls_back_to_default(self):
+        os.environ["JARVIS_MIN_SPEECH_SECONDS"] = "abc"
+        self.assertEqual(get_min_speech_seconds(), 0.25)
+        os.environ["JARVIS_MIN_SPEECH_SECONDS"] = "-1.0"
+        self.assertEqual(get_min_speech_seconds(), 0.25)
+
+    def test_speech_vs_snap(self):
+        # Fala de ~0.3s passa
+        self.assertFalse(is_speech_too_short(0.30))
+        self.assertFalse(is_speech_too_short(0.50))
+        # Estalo de ~0.1s não passa
+        self.assertTrue(is_speech_too_short(0.10))
+        self.assertTrue(is_speech_too_short(0.24))
+
+    def test_measure_wav_speech_duration(self):
+        # Empty audio
+        self.assertEqual(measure_wav_speech_duration(b""), 0.0)
+
+        # 1-second WAV of pure silence (all 0s)
+        import io
+        import wave
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 16000)
+        self.assertEqual(measure_wav_speech_duration(buf.getvalue()), 0.0)
+
+        # Estalo: 2 blocos de 512 amostras = 1024 bytes = 0.064s cercados de silêncio
+        buf_snap = io.BytesIO()
+        with wave.open(buf_snap, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 1024)
+            wf.writeframes(b"\x00\x20" * 1024)
+            wf.writeframes(b"\x00\x00" * 1024)
+        dur_snap = measure_wav_speech_duration(buf_snap.getvalue())
+        self.assertAlmostEqual(dur_snap, 0.064, delta=0.02)
+        self.assertTrue(is_speech_too_short(dur_snap))
+
+        # Fala de ~0.32s: 10 blocos de 512 amostras = 5120 amostras = 0.32s cercados de silêncio
+        buf_speech = io.BytesIO()
+        with wave.open(buf_speech, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 1024)
+            wf.writeframes(b"\x00\x20" * 5120)
+            wf.writeframes(b"\x00\x00" * 1024)
+        dur_speech = measure_wav_speech_duration(buf_speech.getvalue())
+        self.assertAlmostEqual(dur_speech, 0.32, delta=0.05)
+        self.assertFalse(is_speech_too_short(dur_speech))
 
 
 class TestAntiEchoPlaybackGuard(unittest.TestCase):
@@ -190,6 +250,27 @@ class TestWakeWindowAndSession(unittest.TestCase):
         self.assertTrue(session.is_awake)
         session.sleep()
         self.assertFalse(session.is_awake)
+
+    def test_remaining_awake_time(self):
+        session = WakeWordSession(window_seconds=2.0)
+        self.assertEqual(session.remaining_awake_time(), 0.0)
+
+        session.touch(wake_named=True)
+        rem = session.remaining_awake_time()
+        self.assertTrue(1.5 < rem <= 2.0)
+
+        session.sleep()
+        self.assertEqual(session.remaining_awake_time(), 0.0)
+
+    def test_touch_without_arguments_preserves_wake_named(self):
+        session = WakeWordSession(window_seconds=10.0)
+        session.touch(wake_named=True)
+        self.assertTrue(session.last_wake_named)
+
+        # Renew after assistant responds
+        session.touch()
+        self.assertTrue(session.last_wake_named)
+        self.assertTrue(session.is_awake)
 
     def test_wake_stt_model_selection(self):
         session_default = WakeWordSession()
@@ -296,6 +377,62 @@ class TestSimSenhorCache(unittest.TestCase):
         played = play_sim_senhor(mock_session, console=mock_console, voice_id="none")
         self.assertFalse(played)
         mock_console.print.assert_called_once_with("[dim cyan]Sim, senhor.[/dim cyan]")
+
+
+class TestListenForWakeTurn(unittest.TestCase):
+    """Test listen_for_wake_turn flow for both sleeping and awake states."""
+
+    def setUp(self):
+        reset_playback_guard()
+
+    def tearDown(self):
+        reset_playback_guard()
+
+    @patch("openjarvis.speech.wake.record_wake_chunk_audio")
+    def test_inline_command_while_sleeping(self, mock_record):
+        from openjarvis.speech.wake import WakeWordSession, listen_for_wake_turn
+
+        mock_record.return_value = (b"dummy_wav", 1.2)
+        mock_session = MagicMock()
+        mock_stt = MagicMock()
+        mock_res = MagicMock()
+        mock_res.text = "Junior, que horas são?"
+        mock_stt.transcribe.return_value = mock_res
+        mock_session.get_stt_backend.return_value = mock_stt
+
+        console = MagicMock()
+        wake_session = WakeWordSession(wake_word="junior")
+        self.assertFalse(wake_session.is_awake)
+
+        result = listen_for_wake_turn(console, mock_session, wake_session)
+        self.assertEqual(result, "que horas são?")
+        self.assertTrue(wake_session.is_awake)
+        self.assertTrue(wake_session.last_wake_named)
+
+    @patch("openjarvis.speech.wake.record_wake_chunk_audio")
+    @patch("openjarvis.speech.wake.play_sim_senhor")
+    @patch("openjarvis.cli._voice_chat.record_voice")
+    def test_call_alone_triggers_sim_senhor_then_record(self, mock_rec_voice, mock_play, mock_chunk):
+        from openjarvis.speech.wake import WakeWordSession, listen_for_wake_turn
+
+        mock_chunk.return_value = (b"dummy_wav", 0.8)
+        mock_session = MagicMock()
+        mock_stt = MagicMock()
+        mock_res = MagicMock()
+        mock_res.text = "Junior, você tá aí?"
+        mock_stt.transcribe.return_value = mock_res
+        mock_session.get_stt_backend.return_value = mock_stt
+        mock_rec_voice.return_value = "criar evento"
+
+        console = MagicMock()
+        wake_session = WakeWordSession(wake_word="junior")
+        result = listen_for_wake_turn(console, mock_session, wake_session)
+
+        mock_play.assert_called_once_with(mock_session, console)
+        mock_rec_voice.assert_called_once_with(console, mock_session)
+        self.assertEqual(result, "criar evento")
+        self.assertTrue(wake_session.is_awake)
+        self.assertTrue(wake_session.last_wake_named)
 
 
 if __name__ == "__main__":
