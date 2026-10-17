@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from openjarvis.agents._stubs import AgentResult
+from openjarvis.agents._stubs import AgentContext, AgentResult
 from openjarvis.agents.agenda import (
     AgendaAgent,
     format_agenda_phrase,
@@ -605,6 +605,36 @@ class TestAgendaCreation(unittest.TestCase):
         # Cancel on "cancela"
         res3 = self.agent.run("cancela")
         self.assertEqual(res3.content, "Marcação cancelada.")
+        self.assertIsNone(self.agent._pending_event)
+
+    def test_wake_mode_confirmation_without_wake_named_asks_for_security(self):
+        self.agent._pending_event = None
+        self.agent.run("marca dentista amanhã às 15h")
+        self.assertIsNotNone(self.agent._pending_event)
+
+        ctx_unnamed = AgentContext()
+        ctx_unnamed.metadata["wake_mode"] = True
+        ctx_unnamed.metadata["wake_named"] = False
+
+        res = self.agent.run("sim", context=ctx_unnamed)
+        self.assertEqual(res.content, "Por segurança, confirme dizendo 'Junior, sim'.")
+        self.assertIsNotNone(self.agent._pending_event)
+        self.assertEqual(self.agent._pending_event.awaiting, "confirmation")
+
+    @patch("openjarvis.connectors.gcalendar.GCalendarConnector.is_connected", return_value=True)
+    @patch("openjarvis.agents.agenda.check_duplicate_event", return_value=None)
+    @patch("openjarvis.agents.agenda.create_calendar_event")
+    def test_wake_mode_confirmation_with_wake_named_creates_event(self, mock_create, mock_dup, mock_is_conn):
+        self.agent._pending_event = None
+        self.agent.run("marca dentista amanhã às 15h")
+
+        ctx_named = AgentContext()
+        ctx_named.metadata["wake_mode"] = True
+        ctx_named.metadata["wake_named"] = True
+
+        res = self.agent.run("sim", context=ctx_named)
+        self.assertEqual(res.content, "Pronto: Dentista, sexta 16/10, 15h.")
+        mock_create.assert_called_once()
         self.assertIsNone(self.agent._pending_event)
 
 

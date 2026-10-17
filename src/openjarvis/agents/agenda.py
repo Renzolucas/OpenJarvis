@@ -409,6 +409,14 @@ class AgendaAgent(BaseAgent):
             if self._pending_event.awaiting == "confirmation":
                 # Rule 2: Confirms ONLY on short affirmative; anything else cancels
                 if is_short_affirmative(input):
+                    wake_mode = bool(context and context.metadata.get("wake_mode"))
+                    wake_named = bool(context and context.metadata.get("wake_named"))
+                    if wake_mode and not wake_named:
+                        content = "Por segurança, confirme dizendo 'Junior, sim'."
+                        self._pending_event.turns_alive = max(0, self._pending_event.turns_alive - 1)
+                        self._emit_turn_end(content_length=len(content))
+                        return AgentResult(content=content, turns=1)
+
                     pending = self._pending_event
                     self._pending_event = None
                     content = self._execute_event_creation(pending)

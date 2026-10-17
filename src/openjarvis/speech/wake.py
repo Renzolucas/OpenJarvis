@@ -360,12 +360,11 @@ class WakeWordSession:
         self._is_awake = False
         return False
 
-    def touch(self, wake_named: Optional[bool] = None) -> None:
+    def touch(self, wake_named: bool = False) -> None:
         """Mark interaction, renewing the active window for ~10 seconds."""
         self._is_awake = True
         self._awake_until = time.perf_counter() + self.window_seconds
-        if wake_named is not None:
-            self.last_wake_named = wake_named
+        self.last_wake_named = wake_named
 
     def remaining_awake_time(self) -> float:
         """Return remaining seconds in active window, or 0.0 if expired."""
@@ -390,6 +389,26 @@ class WakeWordSession:
             self._dedicated_wake_backend = FasterWhisperBackend(model_size=self.wake_model_name)
 
         return self._dedicated_wake_backend
+
+
+def drain_stream(stream: Any, chunk_size: int = 1024) -> None:
+    """Drain and discard unread audio frames buffered in the stream."""
+    if stream is None:
+        return
+    try:
+        available = getattr(stream, "read_available", 0)
+        if available > 0:
+            while available > 0:
+                to_read = min(available, chunk_size * 4)
+                stream.read(to_read)
+                available = getattr(stream, "read_available", 0)
+            return
+    except Exception:
+        pass
+    try:
+        stream.read(chunk_size)
+    except Exception:
+        pass
 
 
 def record_wake_chunk_audio(
@@ -454,7 +473,8 @@ def record_wake_chunk_audio(
     for _ in range(max_chunks):
         if is_playback_active():
             pre_buffer.clear()
-            time.sleep(0.05)
+            drain_stream(stream, chunk_size)
+            time.sleep(0.02)
             return None
 
         raw, _ = stream.read(chunk_size)
@@ -598,10 +618,20 @@ def listen_for_wake_turn(
                         console.print(
                             f"[dim yellow][TEMPO] Do chamado até a resposta: {t_ack:.2f}s[/dim yellow]"
                         )
-                    wake_session.touch(wake_named=True)
+                    wake_session.touch(wake_named=False)
                     # Now record the actual command from the user
                     console.print("[dim cyan]Listening… (speak now, stops on silence)[/dim cyan]")
-                    return record_voice(console, session)
+                    cmd_text = record_voice(console, session)
+                    if isinstance(cmd_text, str) and cmd_text:
+                        follow_res = parse_wake_phrase(cmd_text, wake_session.wake_word)
+                        if follow_res.detected:
+                            wake_session.touch(wake_named=True)
+                            return follow_res.clean_text or cmd_text
+                        else:
+                            wake_session.touch(wake_named=False)
+                            return cmd_text
+                    wake_session.touch(wake_named=False)
+                    return cmd_text
                 else:
                     # Inline command: e.g. "Junior, o que tenho hoje?" or "Junior, sim"
                     wake_session.touch(wake_named=True)
@@ -675,6 +705,7 @@ def listen_for_wake_turn(
 __all__ = [
     "WakeParseResult",
     "WakeWordSession",
+    "drain_stream",
     "get_min_speech_seconds",
     "get_sim_senhor_cache_path",
     "get_wake_window_seconds",

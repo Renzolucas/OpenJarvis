@@ -541,7 +541,7 @@ def chat(
                     )
             if wake_session is not None:
                 wake_session.t_call_start = None
-                wake_session.touch()
+                wake_session.touch(wake_named=False)
 
             publish_completed_exchange(
                 bus,

@@ -740,3 +740,94 @@ class TestChatAgents:
         assert "chat executed!" not in result.output
         assert "Confirm:" not in result.output
         assert limiter.keys == ["tool_chat_agent:dangerous_chat"]
+
+    def test_wake_agenda_confirmation_integration_sequence(self) -> None:
+        """Integration test: Junior, marca... -> sim (refused) -> Junior, sim (created)."""
+        from openjarvis.agents.agenda import AgendaAgent
+        if not AgentRegistry.contains("agenda"):
+            AgentRegistry.register_value("agenda", AgendaAgent)
+
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+
+        mock_stt = MagicMock()
+        mock_stt.transcribe.side_effect = [
+            SimpleNamespace(text="Junior, marca dentista amanhã às 15h"),
+            SimpleNamespace(text="sim"),
+            SimpleNamespace(text="Junior, sim"),
+        ]
+
+        mock_sd = MagicMock()
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.memory.build_memory_service", return_value=None),
+            patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
+            patch("openjarvis.cli._runtime_panel.tty_wants_runtime_panel", return_value=False),
+            patch("openjarvis.speech._discovery.get_speech_backend", return_value=mock_stt),
+            patch("sounddevice.RawInputStream", return_value=mock_sd),
+            patch("openjarvis.speech.wake.record_wake_chunk_audio", side_effect=[(b"riff", 1.0), KeyboardInterrupt]),
+            patch("openjarvis.speech.voice_io.record_until_silence", side_effect=[b"riff", b"riff", KeyboardInterrupt]),
+            patch("openjarvis.speech.voice_io.play_wav"),
+            patch("openjarvis.cli.chat_cmd.speak"),
+            patch("openjarvis.connectors.gcalendar.GCalendarConnector.is_connected", return_value=True),
+            patch("openjarvis.agents.agenda.check_duplicate_event", return_value=None),
+            patch("openjarvis.agents.agenda.create_calendar_event") as mock_create,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(chat, ["--wake", "junior", "--agent", "agenda", "--model", "test-model"])
+
+        assert result.exit_code == 0
+        assert "confirme dizendo 'Junior, sim'." in result.output
+        assert "Dentista" in result.output
+        mock_create.assert_called_once()
+
+    def test_wake_agenda_call_alone_then_sim_refused(self) -> None:
+        """Integration test: Junior alone -> Sim, senhor. -> sim without name -> refused."""
+        from openjarvis.agents.agenda import AgendaAgent
+        if not AgentRegistry.contains("agenda"):
+            AgentRegistry.register_value("agenda", AgendaAgent)
+
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+
+        mock_stt = MagicMock()
+        mock_stt.transcribe.side_effect = [
+            SimpleNamespace(text="Junior, marca dentista amanhã às 15h"),
+            SimpleNamespace(text="Junior"),
+            SimpleNamespace(text="sim"),
+        ]
+
+        mock_sd = MagicMock()
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.memory.build_memory_service", return_value=None),
+            patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
+            patch("openjarvis.cli._runtime_panel.tty_wants_runtime_panel", return_value=False),
+            patch("openjarvis.speech._discovery.get_speech_backend", return_value=mock_stt),
+            patch("sounddevice.RawInputStream", return_value=mock_sd),
+            patch("openjarvis.speech.wake.record_wake_chunk_audio", side_effect=[(b"riff", 1.0), (b"riff", 0.5), KeyboardInterrupt]),
+            patch("openjarvis.speech.voice_io.record_until_silence", side_effect=[b"riff", KeyboardInterrupt]),
+            patch("openjarvis.speech.wake.play_sim_senhor"),
+            patch("openjarvis.speech.voice_io.play_wav"),
+            patch("openjarvis.cli.chat_cmd.speak"),
+            patch("openjarvis.connectors.gcalendar.GCalendarConnector.is_connected", return_value=True),
+            patch("openjarvis.agents.agenda.check_duplicate_event", return_value=None),
+            patch("openjarvis.agents.agenda.create_calendar_event") as mock_create,
+            patch("openjarvis.speech.wake.WakeWordSession.touch", side_effect=lambda wake_named=False: None),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(chat, ["--wake", "junior", "--agent", "agenda", "--model", "test-model"])
+
+        assert result.exit_code == 0
+        assert "confirme dizendo 'Junior, sim'." in result.output
+        mock_create.assert_not_called()

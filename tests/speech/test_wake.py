@@ -216,6 +216,42 @@ class TestAntiEchoPlaybackGuard(unittest.TestCase):
         time.sleep(0.15)
         self.assertFalse(is_playback_active())
 
+    def test_audio_during_playback_and_cooldown_is_discarded(self):
+        """Audio captured while Jarvis speaks and during ~0.5s cooldown must be discarded."""
+        from collections import deque
+        from openjarvis.speech.wake import (
+            mark_playback_start,
+            mark_playback_end,
+            record_wake_chunk_audio,
+        )
+
+        mock_stream = MagicMock()
+        loud_chunk = b"\x00\x20" * 512
+        mock_stream.read.return_value = (loud_chunk, False)
+        pre_buf = deque([loud_chunk, loud_chunk], maxlen=10)
+
+        # 1. During active playback: must discard audio, drain stream, and return None
+        mark_playback_start()
+        self.assertTrue(is_playback_active())
+        res = record_wake_chunk_audio(stream=mock_stream, pre_buffer=pre_buf)
+        self.assertIsNone(res)
+        self.assertEqual(len(pre_buf), 0)
+        mock_stream.read.assert_called()
+
+        # 2. During cooldown (0.5s): must still discard audio, drain stream, and return None
+        mock_stream.read.reset_mock()
+        pre_buf.append(loud_chunk)
+        mark_playback_end(cooldown_seconds=0.5)
+        self.assertTrue(is_playback_active())
+        res = record_wake_chunk_audio(stream=mock_stream, pre_buffer=pre_buf)
+        self.assertIsNone(res)
+        self.assertEqual(len(pre_buf), 0)
+        mock_stream.read.assert_called()
+
+        # 3. After cooldown expires: normal listening resumes
+        reset_playback_guard()
+        self.assertFalse(is_playback_active())
+
 
 class TestWakeWindowAndSession(unittest.TestCase):
     """Test 10-second active conversational window and session state."""
@@ -262,14 +298,14 @@ class TestWakeWindowAndSession(unittest.TestCase):
         session.sleep()
         self.assertEqual(session.remaining_awake_time(), 0.0)
 
-    def test_touch_without_arguments_preserves_wake_named(self):
+    def test_touch_without_arguments_resets_wake_named(self):
         session = WakeWordSession(window_seconds=10.0)
         session.touch(wake_named=True)
         self.assertTrue(session.last_wake_named)
 
-        # Renew after assistant responds
+        # Renew after assistant responds: resets wake_named to False for next turn
         session.touch()
-        self.assertTrue(session.last_wake_named)
+        self.assertFalse(session.last_wake_named)
         self.assertTrue(session.is_awake)
 
     def test_wake_stt_model_selection(self):
@@ -432,6 +468,33 @@ class TestListenForWakeTurn(unittest.TestCase):
         mock_rec_voice.assert_called_once_with(console, mock_session)
         self.assertEqual(result, "criar evento")
         self.assertTrue(wake_session.is_awake)
+        # Follow-up command did NOT mention name -> wake_named must be False!
+        self.assertFalse(wake_session.last_wake_named)
+
+    @patch("openjarvis.speech.wake.record_wake_chunk_audio")
+    @patch("openjarvis.speech.wake.play_sim_senhor")
+    @patch("openjarvis.cli._voice_chat.record_voice")
+    def test_call_alone_triggers_sim_senhor_then_record_with_wake_named(self, mock_rec_voice, mock_play, mock_chunk):
+        from openjarvis.speech.wake import WakeWordSession, listen_for_wake_turn
+
+        mock_chunk.return_value = (b"dummy_wav", 0.8)
+        mock_session = MagicMock()
+        mock_stt = MagicMock()
+        mock_res = MagicMock()
+        mock_res.text = "Junior, você tá aí?"
+        mock_stt.transcribe.return_value = mock_res
+        mock_session.get_stt_backend.return_value = mock_stt
+        mock_rec_voice.return_value = "Junior, criar evento"
+
+        console = MagicMock()
+        wake_session = WakeWordSession(wake_word="junior")
+        result = listen_for_wake_turn(console, mock_session, wake_session)
+
+        mock_play.assert_called_once_with(mock_session, console)
+        mock_rec_voice.assert_called_once_with(console, mock_session)
+        self.assertEqual(result, "criar evento")
+        self.assertTrue(wake_session.is_awake)
+        # Follow-up command mentioned name -> wake_named is True!
         self.assertTrue(wake_session.last_wake_named)
 
 
